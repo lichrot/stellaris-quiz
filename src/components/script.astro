@@ -1,0 +1,796 @@
+<script>
+  (() => {
+    "use strict";
+
+    /* ------------------------------------------------------------------ *
+     * Types
+     * ------------------------------------------------------------------ */
+
+    /** Checkbox question: values of checked boxes, in canonical DOM order. */
+    type MultiAnswer = string[];
+
+    /** Mapping question: left-item key -> chosen dropdown value ("" = not chosen). */
+    type MapAnswer = Record<string, string>;
+
+    /** Open question with one input: raw input text. */
+    type TextAnswer = string;
+
+    /** Open question with several inputs: one string per input, in DOM order. */
+    type TextsAnswer = string[];
+
+    type Answer = MultiAnswer | MapAnswer | TextAnswer | TextsAnswer;
+
+    /** Whole form state: one field per question, keyed by question id (q1..q8). */
+    type Answers = Record<string, Answer>;
+
+    interface MultiQuestion {
+      kind: "multi";
+      /** Question id, equals checkbox `name`. */
+      id: string;
+      /** Checkbox values, in canonical (pre-scramble) DOM order. */
+      options: string[];
+    }
+
+    interface MapQuestion {
+      kind: "map";
+      /** Question id, prefix of every select `name`. */
+      id: string;
+      /** Left-item keys (select name minus `<id>-`). */
+      keys: string[];
+      /** Allowed dropdown values per key (includes "" for the placeholder). */
+      choices: Record<string, string[]>;
+    }
+
+    interface TextQuestion {
+      kind: "text";
+      /** Question id, equals input `id` and `name`. */
+      id: string;
+    }
+
+    interface TextsQuestion {
+      kind: "texts";
+      /** Question id, prefix of every input `name`. */
+      id: string;
+      /** Input names, in DOM order (answer index = position). */
+      fields: string[];
+    }
+
+    type Question = MultiQuestion | MapQuestion | TextQuestion | TextsQuestion;
+
+    /** Everything that can happen to the state. */
+    type Action =
+      | { type: "toggle"; id: string; value: string; checked: boolean }
+      | { type: "select"; id: string; key: string; value: string }
+      | { type: "text"; id: string; value: string }
+      | { type: "texts"; id: string; index: number; value: string };
+
+    /** Payload of the `quiz:change` event fired on the form. */
+    interface QuizChangeDetail {
+      /** Id of the question that changed. */
+      id: string;
+      /** Snapshot of the full state after the change. */
+      answers: Answers;
+    }
+
+    /** Quiz timing as Unix timestamps in ms; `null` = not happened yet. */
+    interface Session {
+      startedAt: number | null;
+      finishedAt: number | null;
+    }
+
+    /** Everything persisted under the `store` key. */
+    interface Saved {
+      answers: Answers;
+      session: Session;
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Setup
+     * ------------------------------------------------------------------ */
+
+    /** Key used for both the URL search param and the localStorage entry. */
+    const STORE_KEY = "store";
+
+    const formEl = document.getElementById("quiz");
+    if (!(formEl instanceof HTMLFormElement)) {
+      throw new Error('quiz: <form id="quiz"> not found');
+    }
+    const form: HTMLFormElement = formEl;
+
+    /**
+     * Build the question schema by reading the markup once.
+     * Group kind is inferred: `<ul>` with selects -> map, with text inputs -> texts,
+     * with checkboxes -> multi; bare text input -> text.
+     */
+    function discoverQuestions(root: HTMLFormElement): Question[] {
+      const questions: Question[] = [];
+
+      for (const section of root.querySelectorAll(":scope > section")) {
+        const list = section.querySelector<HTMLUListElement>(":scope > ul[id]");
+        const text = section.querySelector<HTMLInputElement>(
+          ':scope > input[type="text"]',
+        );
+
+        if (list) {
+          const selects = list.querySelectorAll<HTMLSelectElement>("select");
+          const inputs =
+            list.querySelectorAll<HTMLInputElement>('input[type="text"]');
+
+          if (selects.length > 0) {
+            const entries = Array.from(selects, (s) => ({
+              key: s.name.slice(list.id.length + 1),
+              values: Array.from(s.options, (o) => o.value),
+            }));
+            questions.push({
+              kind: "map",
+              id: list.id,
+              keys: entries.map((e) => e.key),
+              choices: Object.fromEntries(
+                entries.map((e) => [e.key, e.values]),
+              ),
+            });
+          } else if (inputs.length > 0) {
+            questions.push({
+              kind: "texts",
+              id: list.id,
+              fields: Array.from(inputs, (i) => i.name),
+            });
+          } else {
+            const boxes = list.querySelectorAll<HTMLInputElement>(
+              'input[type="checkbox"]',
+            );
+            questions.push({
+              kind: "multi",
+              id: list.id,
+              options: Array.from(boxes, (b) => b.value),
+            });
+          }
+        } else if (text) {
+          questions.push({ kind: "text", id: text.id });
+        }
+      }
+
+      return questions;
+    }
+
+    // Must run before scrambling: captures the canonical option order.
+    const questions = discoverQuestions(form);
+    const questionById = new Map<string, Question>(
+      questions.map((q) => [q.id, q]),
+    );
+
+    /* ------------------------------------------------------------------ *
+     * Scramble: random option order on every full (re)load.
+     * Nodes are moved, not cloned, so checked state, values and listeners survive.
+     * ------------------------------------------------------------------ */
+
+    /** In-place Fisher-Yates shuffle; returns the same array. */
+    function shuffle<T>(items: T[]): T[] {
+      for (let i = items.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [items[i], items[j]] = [items[j], items[i]];
+      }
+      return items;
+    }
+
+    /**
+     * Reorder `children` of `parent` randomly. Defaults to all element children;
+     * with a subset, the remaining children stay first, in place.
+     */
+    function scrambleChildren(
+      parent: Element,
+      children: Element[] = Array.from(parent.children),
+    ): void {
+      const fragment = document.createDocumentFragment();
+      for (const child of shuffle(children)) fragment.appendChild(child);
+      parent.appendChild(fragment);
+    }
+
+    /** Shuffle real options of a `<select>`; the empty-value placeholder stays on top. */
+    function scrambleSelect(select: HTMLSelectElement): void {
+      const real = Array.from(select.options).filter((o) => o.value !== "");
+      scrambleChildren(select, real);
+    }
+
+    function scrambleForm(root: HTMLFormElement): void {
+      // Questions themselves: shuffle the <section> blocks.
+      scrambleChildren(
+        root,
+        Array.from(root.querySelectorAll(":scope > section")),
+      );
+
+      // Checkbox lists and mapping rows: shuffle the <li> items.
+      // Lists of text inputs stay in order (their fields are numbered).
+      for (const list of root.querySelectorAll(":scope > section > ul")) {
+        if (list.querySelector('input[type="text"]')) continue;
+        scrambleChildren(list);
+      }
+
+      // Mapping dropdowns: shuffle each one's options independently.
+      for (const select of root.querySelectorAll<HTMLSelectElement>("select")) {
+        scrambleSelect(select);
+      }
+    }
+
+    scrambleForm(form);
+
+    /* ------------------------------------------------------------------ *
+     * State
+     * ------------------------------------------------------------------ */
+
+    /** Empty answer for every question. */
+    function createInitialState(): Answers {
+      const state: Answers = {};
+      for (const q of questions) {
+        switch (q.kind) {
+          case "multi":
+            state[q.id] = [];
+            break;
+          case "map":
+            state[q.id] = Object.fromEntries(q.keys.map((k) => [k, ""]));
+            break;
+          case "texts":
+            state[q.id] = q.fields.map(() => "");
+            break;
+          case "text":
+            state[q.id] = "";
+            break;
+        }
+      }
+      return state;
+    }
+
+    /** Pure reducer. Returns the same object when nothing changed. */
+    function reduce(state: Answers, action: Action): Answers {
+      const question = questionById.get(action.id);
+      if (!question) return state;
+
+      switch (action.type) {
+        case "toggle": {
+          if (question.kind !== "multi") return state;
+          const current = state[question.id] as MultiAnswer;
+          const picked = new Set(current);
+          if (action.checked) picked.add(action.value);
+          else picked.delete(action.value);
+          // keep canonical order so the array is deterministic regardless of click/scramble order
+          const next = question.options.filter((v) => picked.has(v));
+          const same =
+            next.length === current.length &&
+            next.every((v, i) => v === current[i]);
+          return same ? state : { ...state, [question.id]: next };
+        }
+
+        case "select": {
+          if (question.kind !== "map") return state;
+          const current = state[question.id] as MapAnswer;
+          if (!(action.key in current) || current[action.key] === action.value)
+            return state;
+          return {
+            ...state,
+            [question.id]: { ...current, [action.key]: action.value },
+          };
+        }
+
+        case "text": {
+          if (question.kind !== "text") return state;
+          return state[question.id] === action.value
+            ? state
+            : { ...state, [question.id]: action.value };
+        }
+
+        case "texts": {
+          if (question.kind !== "texts") return state;
+          const current = state[question.id] as TextsAnswer;
+          if (
+            action.index < 0 ||
+            action.index >= current.length ||
+            current[action.index] === action.value
+          ) {
+            return state;
+          }
+          const next = current.slice();
+          next[action.index] = action.value;
+          return { ...state, [question.id]: next };
+        }
+      }
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Persistence: state <-> base64url(JSON) in URL param and localStorage
+     * ------------------------------------------------------------------ */
+
+    /** Saved data -> base64url of the UTF-8 JSON (URL-safe alphabet, no padding). */
+    function encodeStore(saved: Saved): string {
+      const payload = { answers: saved.answers, ...saved.session };
+      const bytes = new TextEncoder().encode(JSON.stringify(payload));
+      let binary = "";
+      for (const byte of bytes) binary += String.fromCharCode(byte);
+      return btoa(binary)
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/, "");
+    }
+
+    /** Inverse of `encodeStore`. Throws on malformed base64, UTF-8 or JSON. */
+    function decodeStore(encoded: string): unknown {
+      const binary = atob(encoded.replace(/-/g, "+").replace(/_/g, "/"));
+      const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+      return JSON.parse(
+        new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+      );
+    }
+
+    function isStringArray(value: unknown): value is string[] {
+      return Array.isArray(value) && value.every((v) => typeof v === "string");
+    }
+
+    function isRecord(value: unknown): value is Record<string, unknown> {
+      return (
+        typeof value === "object" && value !== null && !Array.isArray(value)
+      );
+    }
+
+    /**
+     * Fit untrusted data to the current schema. Per question, wrong types, unknown
+     * keys and unknown option values fall back to that question's empty answer.
+     */
+    function sanitizeAnswers(value: unknown): Answers {
+      const state = createInitialState();
+      if (!isRecord(value)) return state;
+
+      for (const q of questions) {
+        const got = value[q.id];
+        switch (q.kind) {
+          case "multi":
+            if (isStringArray(got)) {
+              const picked = new Set(got);
+              state[q.id] = q.options.filter((v) => picked.has(v));
+            }
+            break;
+
+          case "map":
+            if (isRecord(got)) {
+              const answer = state[q.id] as MapAnswer;
+              for (const key of q.keys) {
+                const chosen = got[key];
+                if (
+                  typeof chosen === "string" &&
+                  q.choices[key].includes(chosen)
+                ) {
+                  answer[key] = chosen;
+                }
+              }
+            }
+            break;
+
+          case "texts":
+            if (Array.isArray(got)) {
+              state[q.id] = q.fields.map((_, i) =>
+                typeof got[i] === "string" ? got[i] : "",
+              );
+            }
+            break;
+
+          case "text":
+            if (typeof got === "string") state[q.id] = got;
+            break;
+        }
+      }
+      return state;
+    }
+
+    /** A usable timestamp: finite, positive number. */
+    function toTimestamp(value: unknown): number | null {
+      return typeof value === "number" && Number.isFinite(value) && value > 0
+        ? value
+        : null;
+    }
+
+    /** Untrusted decoded JSON -> Saved. Non-objects yield null (treated as empty). */
+    function sanitizeSaved(value: unknown): Saved | null {
+      if (!isRecord(value)) return null;
+      const startedAt = toTimestamp(value.startedAt);
+      const end = toTimestamp(value.finishedAt);
+      // an end without a start, or before it, is meaningless
+      const finishedAt =
+        startedAt !== null && end !== null && end >= startedAt ? end : null;
+      return {
+        answers: sanitizeAnswers(value.answers),
+        session: { startedAt, finishedAt },
+      };
+    }
+
+    /** Parse one stored string; null when missing or malformed in any way. */
+    function parseStore(raw: string | null): Saved | null {
+      if (!raw) return null;
+      try {
+        return sanitizeSaved(decodeStore(raw));
+      } catch {
+        return null;
+      }
+    }
+
+    function readStorage(): string | null {
+      try {
+        return localStorage.getItem(STORE_KEY);
+      } catch {
+        return null; // storage blocked or unavailable
+      }
+    }
+
+    /** Saved data: URL search param first, localStorage only if the URL gave nothing usable. */
+    function restore(): Saved | null {
+      const fromUrl = parseStore(
+        new URLSearchParams(location.search).get(STORE_KEY),
+      );
+      return fromUrl ?? parseStore(readStorage());
+    }
+
+    /** Current answers + timing, as persisted. */
+    function currentSaved(): Saved {
+      return { answers: state, session };
+    }
+
+    /** Write the current data to localStorage and to the URL (no new history entry). */
+    function persist(): void {
+      const encoded = encodeStore(currentSaved());
+
+      try {
+        localStorage.setItem(STORE_KEY, encoded);
+      } catch {
+        // storage blocked or full: URL copy still works
+      }
+
+      try {
+        const url = new URL(location.href);
+        url.searchParams.set(STORE_KEY, encoded);
+        history.replaceState(history.state, "", url);
+      } catch {
+        // e.g. file:// pages forbid URL changes
+      }
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Render: state -> DOM (the form never holds truth of its own)
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Push state into every control.
+     * Writes only when a control differs, so caret position survives typing.
+     */
+    function render(next: Answers): void {
+      for (const q of questions) {
+        switch (q.kind) {
+          case "multi": {
+            const picked = new Set(next[q.id] as MultiAnswer);
+            const boxes = form.querySelectorAll<HTMLInputElement>(
+              `input[type="checkbox"][name="${CSS.escape(q.id)}"]`,
+            );
+            for (const box of boxes) {
+              const want = picked.has(box.value);
+              if (box.checked !== want) box.checked = want;
+            }
+            break;
+          }
+
+          case "map": {
+            const answer = next[q.id] as MapAnswer;
+            for (const key of q.keys) {
+              const select = form.elements.namedItem(`${q.id}-${key}`);
+              if (
+                select instanceof HTMLSelectElement &&
+                select.value !== answer[key]
+              ) {
+                select.value = answer[key];
+              }
+            }
+            break;
+          }
+
+          case "texts": {
+            const answer = next[q.id] as TextsAnswer;
+            q.fields.forEach((name, i) => {
+              const input = form.elements.namedItem(name);
+              if (
+                input instanceof HTMLInputElement &&
+                input.value !== answer[i]
+              ) {
+                input.value = answer[i];
+              }
+            });
+            break;
+          }
+
+          case "text": {
+            const input = document.getElementById(q.id);
+            const want = next[q.id] as TextAnswer;
+            if (input instanceof HTMLInputElement && input.value !== want) {
+              input.value = want;
+            }
+            break;
+          }
+        }
+      }
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Events: DOM -> action -> state -> render + persist
+     * ------------------------------------------------------------------ */
+
+    const restored = restore();
+    let state: Answers = restored?.answers ?? createInitialState();
+    let session: Session = restored?.session ?? {
+      startedAt: null,
+      finishedAt: null,
+    };
+
+    /** Translate a changed control into a state action; null if it is not a quiz control. */
+    function toAction(el: EventTarget | null): Action | null {
+      if (el instanceof HTMLInputElement) {
+        const q =
+          questionById.get(el.name) ??
+          questionById.get(el.name.split("-", 1)[0]);
+        if (el.type === "checkbox" && q?.kind === "multi") {
+          return {
+            type: "toggle",
+            id: q.id,
+            value: el.value,
+            checked: el.checked,
+          };
+        }
+        if (el.type === "text" && q?.kind === "text") {
+          return { type: "text", id: q.id, value: el.value };
+        }
+        if (el.type === "text" && q?.kind === "texts") {
+          return {
+            type: "texts",
+            id: q.id,
+            index: q.fields.indexOf(el.name),
+            value: el.value,
+          };
+        }
+      } else if (el instanceof HTMLSelectElement) {
+        const q = questionById.get(el.name.split("-", 1)[0]);
+        if (q?.kind === "map") {
+          return {
+            type: "select",
+            id: q.id,
+            key: el.name.slice(q.id.length + 1),
+            value: el.value,
+          };
+        }
+      }
+      return null;
+    }
+
+    /** Run an action through the reducer, re-render, persist, notify. */
+    function dispatch(action: Action): void {
+      const next = reduce(state, action);
+      if (next === state) return;
+      state = next;
+      // first interaction starts the timer
+      if (session.startedAt === null) {
+        session = { ...session, startedAt: Date.now() };
+        renderTimer();
+      }
+      render(state);
+      persist();
+
+      const detail: QuizChangeDetail = {
+        id: action.id,
+        answers: structuredClone(state),
+      };
+      form.dispatchEvent(
+        new CustomEvent<QuizChangeDetail>("quiz:change", { detail }),
+      );
+    }
+
+    // `input` fires instantly for text (every keystroke), checkboxes and selects.
+    form.addEventListener("input", (e) => {
+      const action = toAction(e.target);
+      if (action) dispatch(action);
+    });
+
+    // The form is never submitted: block native submission (e.g. Enter in a lone field).
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+    });
+
+    // Reset (if ever added) goes through state too.
+    form.addEventListener("reset", (e) => {
+      e.preventDefault();
+      state = createInitialState();
+      session = { startedAt: null, finishedAt: null };
+      render(state);
+      renderTimer();
+      persist();
+    });
+
+    /* ------------------------------------------------------------------ *
+     * Timer (top right) and toast
+     * ------------------------------------------------------------------ */
+
+    const timerEl = document.getElementById("timer");
+    const toastEl = document.getElementById("toast");
+
+    function pad(n: number): string {
+      return String(n).padStart(2, "0");
+    }
+
+    /** 75_000 -> "01:15", 3_725_000 -> "1:02:05" */
+    function formatClock(ms: number): string {
+      const total = Math.floor(Math.max(0, ms) / 1000);
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+    }
+
+    /** Paint the clock: idle (not started), running, or stopped (finished). */
+    function renderTimer(): void {
+      if (!timerEl) return;
+      const { startedAt, finishedAt } = session;
+      const text =
+        startedAt === null
+          ? formatClock(0)
+          : formatClock((finishedAt ?? Date.now()) - startedAt);
+      const mode =
+        startedAt === null
+          ? "idle"
+          : finishedAt === null
+            ? "running"
+            : "stopped";
+      if (timerEl.textContent !== text) timerEl.textContent = text;
+      if (timerEl.dataset.state !== mode) timerEl.dataset.state = mode;
+    }
+
+    let toastTimer: number | undefined;
+
+    function showToast(message: string, kind: "ok" | "error"): void {
+      if (!toastEl) return;
+      toastEl.textContent = message;
+      toastEl.dataset.kind = kind;
+      toastEl.dataset.visible = "true";
+      window.clearTimeout(toastTimer);
+      toastTimer = window.setTimeout(
+        () => delete toastEl.dataset.visible,
+        7000,
+      );
+    }
+
+    if (toastEl) {
+      toastEl.addEventListener("click", () => delete toastEl.dataset.visible);
+    }
+
+    renderTimer();
+    window.setInterval(renderTimer, 250);
+
+    /* ------------------------------------------------------------------ *
+     * Floating "Завершить" button: stop timer, copy link
+     * ------------------------------------------------------------------ */
+
+    /** Current page URL with the live data in the `store` param (works even if the URL could not be rewritten). */
+    function shareUrl(): string {
+      const url = new URL(location.href);
+      url.searchParams.set(STORE_KEY, encodeStore(currentSaved()));
+      return url.toString();
+    }
+
+    /** Copy text to the clipboard; falls back to execCommand on insecure origins. */
+    async function copyText(text: string): Promise<boolean> {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch {
+        // clipboard API missing or denied: try the legacy path
+      }
+
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      try {
+        return document.execCommand("copy");
+      } catch {
+        return false;
+      } finally {
+        area.remove();
+      }
+    }
+
+    const finishButton = document.getElementById("finish");
+    if (finishButton instanceof HTMLButtonElement) {
+      finishButton.addEventListener("click", async () => {
+        // stop the timer once; repeated clicks only re-copy the link
+        const { startedAt, finishedAt } = session;
+        if (startedAt !== null && finishedAt === null) {
+          session = { startedAt, finishedAt: Math.max(Date.now(), startedAt) };
+          renderTimer();
+        }
+        persist(); // so the copied URL and localStorage carry the end time
+
+        const ok = await copyText(shareUrl());
+        showToast(
+          ok
+            ? "Ссылка скопирована в буфер обмена. Отправьте её администратору."
+            : "Не удалось скопировать ссылку. Скопируйте адрес страницы вручную и отправьте его администратору.",
+          ok ? "ok" : "error",
+        );
+      });
+    }
+
+    /* ------------------------------------------------------------------ *
+     * stats(): the only thing exposed to the outside (call it from the console)
+     * ------------------------------------------------------------------ */
+
+    function formatDate(timestamp: number): string {
+      return new Date(timestamp).toLocaleString("ru-RU", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      });
+    }
+
+    /** 1_108_000 -> "18 мин 28 с" */
+    function formatDuration(ms: number): string {
+      const total = Math.round(Math.max(0, ms) / 1000);
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      if (h > 0) return `${h} ч ${pad(m)} мин ${pad(s)} с`;
+      if (m > 0) return `${m} мин ${pad(s)} с`;
+      return `${s} с`;
+    }
+
+    /** Print start, end and completion time from the saved store; report missing data. */
+    function stats(): void {
+      const saved = restore();
+      const startedAt = saved?.session.startedAt ?? null;
+      const finishedAt = saved?.session.finishedAt ?? null;
+
+      if (startedAt === null) {
+        console.log(
+          "Нет данных: хранилище пусто или таймер ещё не запускался.",
+        );
+        return;
+      }
+      if (finishedAt === null) {
+        console.log(
+          [
+            `Начало:      ${formatDate(startedAt)}`,
+            "Конец:       нет данных (кнопка «Завершить» не нажата)",
+            "Время:       нет данных",
+          ].join("\n"),
+        );
+        return;
+      }
+      console.log(
+        [
+          `Начало:      ${formatDate(startedAt)}`,
+          `Конец:       ${formatDate(finishedAt)}`,
+          `Время:       ${formatDuration(finishedAt - startedAt)}`,
+        ].join("\n"),
+      );
+    }
+
+    (window as Window & { stats?: () => void }).stats = stats;
+
+    // State wins over anything the browser restored (reload, back/forward cache).
+    window.addEventListener("pageshow", () => render(state));
+
+    /* ------------------------------------------------------------------ *
+     * Init
+     * ------------------------------------------------------------------ */
+
+    render(state);
+    // Make URL and localStorage agree when something was restored (URL wins).
+    if (restored) persist();
+  })();
+</script>
